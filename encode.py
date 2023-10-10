@@ -1,121 +1,57 @@
+import os
 from PIL import Image
+from typing import Generator
 
 class OutOfPixelsException(Exception):
     pass
 
-class ImageBytesEditor():
-    def __init__(self, path: str) -> None:
-        self.image = Image.open(path)
-        self.maxX, self.maxY = self.image.size
-        self.maxBand = 3
+def imageBytesEditorGenerator(path: str):
+    image = Image.open(path)
+    width, height = image.size
 
-        self.currentBand = -1
-        self.currentX = 0
-        self.currentY = 0
+    for y in range(height):
+        for x in range(width):
+            pixel = list(image.getpixel((x, y)))
 
-        self._loadCurrentPixel()
+            finish = False
+            for i in range(3):
+                pixel[i] = yield pixel[i]
+                finish = yield
+                if finish:
+                    break
+            
+            image.putpixel((x, y), tuple(pixel))
 
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        self._nextChannel()
-        return self.currentPixel[self.currentBand]
-
-    def setCurrentByte(self, value: int):
-        self.currentPixel[self.currentBand] = value
-
-    def _nextChannel(self):
-        self.currentBand += 1
-
-        if self.currentBand >= self.maxBand:
-            self.currentBand = 0
-
-            self._saveCurrentPixel()
-            self._nextPixel()
-            self._loadCurrentPixel()
-        
-    def _nextPixel(self):
-        self.currentX += 1
-
-        if self.currentX >= self.maxX:
-            self.currentX = 0
-            self.currentY += 1
-
-        if self.currentY >= self.maxY:
-            raise StopIteration
-
-    def _loadCurrentPixel(self):
-        self.currentPixel = list(self.image.getpixel((self.currentX, self.currentY)))
+            if finish:
+                yield image
+                return
     
-    def _saveCurrentPixel(self):
-        self.image.putpixel((self.currentX, self.currentY), tuple(self.currentPixel))
-
-    def getImage(self):
-        # Si l'itérateur est terminé mais qu'on essaye d'enregistrer un pixel, 
-        # une erreur sera rencontrée à self._saveCurrentPixel() car le pixel sera en dehors de l'image
-        if self.currentY >= self.maxY:
-            raise OutOfPixelsException
-        
-        # Si le dernier pixel n'est pas entièrement utilisé, il n'est peut-être pas encore sauvegardé
-        self._saveCurrentPixel()
-        
-        return self.image
-
-class BitIterator:
-    def __init__(self, byteArray: bytearray, byteChunkSize: int = 4) -> None:
-        self.byteArray = bytearray(byteArray) # on duplique le bytearray par sécurité
-        self.currentByte = None
-        self.byteposition: int
-        self.currentByteIndex = 0
-
-        if 8 % byteChunkSize != 0:
-            raise ValueError("byteChunkSize must be a divisor of 8")
-        self.byteChunkSize = byteChunkSize
+    # Si la boucle for se termine, c'est qu'on est à court de pixels
+    raise OutOfPixelsException
     
-    def __iter__(self):
-        return self
+def bitGenerator(bytesList: bytes, byteChunkSize: int) -> Generator[tuple[int | None, int], None, None]:
+    if 8 % byteChunkSize != 0:
+        raise ValueError("byteChunkSize must be a divisor of 8")
     
-    def __next__(self):
-        if self.currentByte == None:
-            self._nextByte()
-        else:
-            self.byteposition += self.byteChunkSize
-            if self.byteposition >= 8:
-                self._nextByte()
+    trimmer = 2 ** byteChunkSize - 1
 
-        return self._extractbits()
+    for i in range(len(bytesList)):
+        for bytePosition in range(0, 8, byteChunkSize):
+            b = bytesList[i]
+            b >>= (8 - bytePosition - byteChunkSize)
+            b &= trimmer
+            yield b, i
     
-    def _nextByte(self):
-        if self.currentByteIndex >= len(self.byteArray):
-            raise StopIteration
-        self.currentByte = self.byteArray[self.currentByteIndex]
-        self.byteposition = 0
-        self.currentByteIndex += 1
+    yield None, len(bytesList)
 
-    def _extractbits(self) -> int:
-        value = self.currentByte
-        value >>= (8 - self.byteposition - self.byteChunkSize)
-        filter = 2 ** (self.byteChunkSize) - 1
-        value &= filter
-        return value
-    
-    def lengthInBytes(self):
-        return len(self.byteArray)
-    
-    def progressInBytes(self):
-        return self.currentByteIndex
-
-def printProgress(bitIterator: BitIterator):
-    progress = bitIterator.progressInBytes()
-    length = bitIterator.lengthInBytes()
+def printProgress(progress: int, length: int):
     percentage = round(100 * progress / length)
 
-    prefix = "\033[1A\x1b[2k"
+    prefix = "\033[1A\x1b[2k" # Ce préfixe permet de réécrire par dessus la dernière ligne printée
     print(f"{prefix}Encoded {percentage}% of bytes ({progress} / {length})")
 
-def writeBytes(imageEditor: ImageBytesEditor, bytes: bytearray, chunkSize: int):
-    bits = BitIterator(bytes, chunkSize)
+def writeBytes(imageEditor: Generator, bytesList: bytes, chunkSize: int):
+    bits = bitGenerator(bytesList, chunkSize)
 
     # un nombre binaire 8bits composé de 1 et se terminant par <chunkSize> 0
     # Exemple: si chunkSize = 2, alors byteTrimmer = 0b11111100
@@ -123,39 +59,40 @@ def writeBytes(imageEditor: ImageBytesEditor, bytes: bytearray, chunkSize: int):
 
     print("") # on imprime une ligne vide pour que les appels à printProgress() puissent réécrire par dessus
 
+    progress = 0
+    length = len(bytesList)
+
     i = 0
-    for colorPart in imageEditor:
+    while True:
         i += 1
         if i == 100000:
             i = 0
-            printProgress(bits)
+            printProgress(progress, length)
 
-        colorPart &= byteTrimmer # on enlève les derniers bits
-        
-        part = next(bits, None) # la partie d'octet à ajouter
-        if part == None: # si tous les bits ont été encodés
-            printProgress(bits)
+        bytePart, progress = next(bits) # la partie d'octet à ajouter
+        if bytePart == None: # si tous les bits ont été encodés
+            printProgress(progress, length)
             return
-                
-        colorPart |= part # on ajoute la partie d'octet à la valeur de la couleur
-        imageEditor.setCurrentByte(colorPart)
 
-    # Si la boucle for se termine naturellement, c'est qu'on est à court de 
-    # pixels et que le message n'a pas été encodé entièrement
-    raise OutOfPixelsException
+        colorPart = imageEditor.send(None)
+        colorPart &= byteTrimmer # on enlève les derniers bits
+        colorPart |= bytePart # on ajoute la partie d'octet à la valeur de la couleur
+        imageEditor.send(colorPart)
 
 def encode(imagePath: str, filePath: str, chunkSize: int):
-    imageEditor = ImageBytesEditor(imagePath)
+    imageEditor = imageBytesEditorGenerator(imagePath)
 
     with open(filePath, "rb") as file:
-        bytesToEncode = bytearray(file.read())
+        bytesToEncode = file.read()
 
     arraySize = len(bytesToEncode)
     # on ajoute 4 bytes au début de l'array pour indiquer la taille du fichier encodé
     bytesToEncode = arraySize.to_bytes(4, "big") + bytesToEncode
 
     writeBytes(imageEditor, bytesToEncode, chunkSize)
-    return imageEditor.getImage()
+    
+    # Envoyer true inique au générateur qu'on a fini de modifier l'image et qu'il peut nous la renvoyer
+    return imageEditor.send(True)
 
 IMG_PATH = "./files/sources/clouds.png"
 FILE_PATH = "./files/sources/abstract.png"
@@ -170,6 +107,7 @@ except OutOfPixelsException:
 
 print("Done ! Writing the resulting image to output file...")
 
+os.makedirs(os.path.dirname(OUT_PATH), exist_ok = True) # on s'assure que les dossiers parents existent
 image.save(OUT_PATH)
 
 print("Finished.")
